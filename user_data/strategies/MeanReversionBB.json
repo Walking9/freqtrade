@@ -1,0 +1,32 @@
+{
+  "strategy_name": "MeanReversionBB",
+  "params": {
+    "roi": {
+      "0": 0.06,
+      "120": 0.04,
+      "360": 0.02,
+      "720": 0.01
+    },
+    "stoploss": {
+      "stoploss": -0.05
+    },
+    "trailing": {
+      "trailing_stop": true,
+      "trailing_stop_positive": 0.015,
+      "trailing_stop_positive_offset": 0.035,
+      "trailing_only_offset_is_reached": true
+    },
+    "max_open_trades": {
+      "max_open_trades": 3
+    },
+    "buy": {
+      "buy_bb_width_factor": 0.89,
+      "buy_rsi": 23
+    },
+    "sell": {
+      "sell_rsi": 79
+    }
+  },
+  "ft_stratparam_v": 1,
+  "export_time": "2026-07-21 16:34:41.701130+00:00"
+}
