@@ -81,7 +81,7 @@
 cd /Users/luka/Project/freqtrade_src/freqtrade
 PYTHONPATH=/Users/luka/Project/freqtrade_src/ai_work/testnet_patch AI_TESTNET_PATCH=1 \
 .venv/bin/freqtrade backtesting --config user_data/config_backtest_ai.json --userdir user_data \
-    --strategy SteadyTrend --timerange 20200101-20250701 --cache none --breakdown month year
+    --strategy SteadyTrend --timerange 20260301-20261001 --cache none --breakdown month year
 ```
 
 补丁只影响"交易对元数据"的获取来源，不影响价格/手续费/资金费数据。**换行后若你有可用线路，去掉 `PYTHONPATH=... AI_TESTNET_PATCH=1` 前缀即可。**
