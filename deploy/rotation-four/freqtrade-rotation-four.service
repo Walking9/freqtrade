@@ -1,0 +1,18 @@
+[Unit]
+Description=Freqtrade RotationConsensus four-asset dry run
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=fre
+WorkingDirectory=/opt/freqtrade
+UnsetEnvironment=PYTHONPATH CONSENSUS_OFFLINE_RESEARCH RELATIVE_MOMENTUM_OFFLINE AI_TESTNET_PATCH CODEX_OFFLINE_RESEARCH
+ExecStart=/opt/freqtrade/.venv/bin/freqtrade trade --config /opt/freqtrade/user_data/config-rotation-four.json --strategy RotationConsensus --strategy-path /opt/freqtrade/user_data/strategies/rotation_four --logfile /opt/freqtrade/user_data/logs/rotation-four.log
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=120
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target
