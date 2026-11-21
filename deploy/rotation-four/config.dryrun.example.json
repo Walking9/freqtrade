@@ -30,6 +30,9 @@
     "name": "binance",
     "key": "",
     "secret": "",
+    "_ft_has_params": {
+      "ohlcv_max_poll_interval_secs": 15
+    },
     "ccxt_config": {
       "enableRateLimit": true,
       "options": {

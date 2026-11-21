@@ -12,14 +12,19 @@ import math
 from datetime import timedelta
 
 import numpy as np
-from pandas import DataFrame, Timedelta, concat
+from pandas import DataFrame, NaT, Timedelta, Timestamp, concat
+from pandas.util import hash_pandas_object
 
 from freqtrade.enums import RunMode
+from freqtrade.exceptions import StrategyError
 from freqtrade.persistence import Trade
-from freqtrade.strategy import IStrategy, informative, stoploss_from_absolute
+from freqtrade.strategy import IStrategy, stoploss_from_absolute
+from freqtrade.util import dt_now
 
 
 logger = logging.getLogger(__name__)
+HOUR = Timedelta(hours=1)
+OHLCV = ["open", "high", "low", "close", "volume"]
 
 
 class RotationConsensus(IStrategy):
@@ -53,8 +58,21 @@ class RotationConsensus(IStrategy):
     }
     order_time_in_force = {"entry": "GTC", "exit": "GTC"}
 
+    def __init__(self, config):
+        super().__init__(config)
+        self._rotation_candle = None
+        self._rotation_frames = {}
+        self._valid_rotation_pairs = set()
+        self._frozen_rotation = False
+        self._rotation_log_state = None
+        self._feed_revisions = {}
+        self._analyzed_revisions = {}
+
     def version(self):
-        return "1.1-four-assets-20261114"
+        return "1.2-four-assets-synced"
+
+    def _runtime_snapshot_enabled(self):
+        return self.config.get("runmode") in (RunMode.DRY_RUN, RunMode.LIVE)
 
     def bot_start(self, **kwargs):
         if (
@@ -64,21 +82,129 @@ class RotationConsensus(IStrategy):
             raise ValueError("RotationConsensus requires isolated futures.")
         if self.timeframe != "1h":
             raise ValueError("RotationConsensus requires 1h candles.")
-        if self.config.get("runmode") in (RunMode.DRY_RUN, RunMode.LIVE):
+        if self._runtime_snapshot_enabled():
             if self.config.get("max_open_trades") != 3:
                 raise ValueError("Expected max_open_trades=3.")
             if set(self.config["exchange"]["pair_whitelist"]) != set(self.UNIVERSE):
                 raise ValueError("Expected frozen four-asset universe.")
 
-    @informative("1h", "BTC/USDT:USDT", fmt="market_{column}", ffill=False)
-    def market_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        f = dataframe.copy()
-        log = np.log(f.close.where(f.close > 0))
+    @staticmethod
+    def _current_feed_is_valid(frame, candle):
+        history = frame.tail(673)
+        if len(history) != 673 or history.date.iloc[-1] != candle:
+            return False
+        if not history.date.diff().iloc[1:].eq(HOUR).all():
+            return False
+        latest = history[OHLCV].iloc[-1].to_numpy(dtype=float)
+        closes = history.close.to_numpy(dtype=float)
+        return bool(
+            np.isfinite(latest).all()
+            and (latest > 0).all()
+            and np.isfinite(closes).all()
+            and (closes > 0).all()
+        )
+
+    def bot_loop_start(self, current_time, **kwargs):
+        if not self._runtime_snapshot_enabled():
+            return
+        decision = Timestamp(current_time).floor("h")
+        candle = decision - HOUR
+        if self._rotation_candle == candle and self._frozen_rotation:
+            return
+
+        frames = {}
+        valid_pairs = set()
+        feed_revisions = {}
+        for pair in self.UNIVERSE:
+            frame = self.dp.ohlcv(pair, self.timeframe, copy=False)
+            if frame.empty:
+                continue
+            # Copy once per poll, before any pair consumes the data for a decision.
+            closed = frame.loc[frame.date.le(candle)].copy()
+            if closed.empty:
+                continue
+            frames[pair] = closed
+            if self._current_feed_is_valid(closed, candle):
+                valid_pairs.add(pair)
+            feed_revisions[pair] = (
+                hash_pandas_object(closed[["date", *OHLCV]].tail(673), index=False)
+                .to_numpy()
+                .tobytes()
+            )
+
+        self._rotation_candle = candle
+        self._rotation_frames = frames
+        self._valid_rotation_pairs = valid_pairs
+        self._feed_revisions = feed_revisions
+        self._frozen_rotation = False
+        if decision.hour % 8 == 0:
+            missing = tuple(
+                pair for pair in self.UNIVERSE if pair not in self._valid_rotation_pairs
+            )
+            delay = (Timestamp(current_time) - decision).total_seconds()
+            self._frozen_rotation = not missing and delay <= self.ignore_buying_expired_candle_after
+            if self._frozen_rotation:
+                status = "ready"
+            elif delay <= self.ignore_buying_expired_candle_after:
+                status = "waiting"
+            else:
+                status = "expired"
+            if (decision, status, missing) != self._rotation_log_state:
+                self._rotation_log_state = (decision, status, missing)
+                latest = {
+                    pair: str(frame.date.iloc[-1]) for pair, frame in self._rotation_frames.items()
+                }
+                logger.info(
+                    "RotationConsensus snapshot=%s candle=%s delay=%.2fs "
+                    "missing_or_invalid=%s latest=%s",
+                    status,
+                    candle,
+                    delay,
+                    missing,
+                    latest,
+                )
+
+    def analyze_pair(self, pair: str) -> None:
+        if not self._runtime_snapshot_enabled():
+            return super().analyze_pair(pair)
+        dataframe = self._rotation_frames.get(pair)
+        if dataframe is None:
+            return
+        # Freqtrade normally caches by the base pair's timestamp alone. Refresh
+        # when the common snapshot is accepted or a fresh input for an independent exit changes.
+        btc = self.UNIVERSE[0]
+        at_rebalance = (self._rotation_candle + HOUR).hour % 8 == 0
+        revision = (
+            self._rotation_candle,
+            self._frozen_rotation,
+            self._feed_revisions[pair],
+            self._feed_revisions.get(btc)
+            if at_rebalance and btc in self._valid_rotation_pairs
+            else None,
+        )
+        if self._analyzed_revisions.get(pair) == revision:
+            return
+        only_new_candles = self.process_only_new_candles
+        self.process_only_new_candles = False
+        try:
+            result = self._analyze_ticker_internal(dataframe, {"pair": pair})
+            if not result.empty:
+                self._analyzed_revisions[pair] = revision
+        except StrategyError as error:
+            logger.warning("Unable to analyze rotation candles for %s: %s", pair, error)
+        finally:
+            self.process_only_new_candles = only_new_candles
+
+    def _consensus(self, log):
         sigma = log.diff().rolling(168, min_periods=168).std().shift(1)
-        f["consensus"] = sum(
+        return sum(
             np.tanh((log - log.shift(h)) / (sigma * np.sqrt(h)).replace(0, np.nan))
             for h in self.HORIZONS
         ) / len(self.HORIZONS)
+
+    def market_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        f = dataframe.copy()
+        f["consensus"] = self._consensus(np.log(f.close.where(f.close > 0)))
         return f[["date", "consensus"]]
 
     def informative_pairs(self):
@@ -87,11 +213,7 @@ class RotationConsensus(IStrategy):
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         f = dataframe.copy()
         log = np.log(f.close.where(f.close > 0))
-        sigma = log.diff().rolling(168, min_periods=168).std().shift(1)
-        f["consensus"] = sum(
-            np.tanh((log - log.shift(h)) / (sigma * np.sqrt(h)).replace(0, np.nan))
-            for h in self.HORIZONS
-        ) / len(self.HORIZONS)
+        f["consensus"] = self._consensus(log)
         true_range = concat(
             [f.high - f.low, (f.high - f.close.shift()).abs(), (f.low - f.close.shift()).abs()],
             axis=1,
@@ -99,13 +221,29 @@ class RotationConsensus(IStrategy):
         f["distance"] = (
             self.ATR_MULTIPLE * true_range.rolling(24, min_periods=24).mean() / f.close
         ).clip(0.03, 0.12)
-        f["history_ok"] = (
-            f.date.diff().eq(Timedelta(hours=1)).rolling(672, min_periods=672).sum().eq(672)
+        f["history_ok"] = f.date.diff().eq(HOUR).rolling(672, min_periods=672).sum().eq(672)
+        runtime = self._runtime_snapshot_enabled()
+        references = (
+            self._rotation_frames
+            if runtime
+            else {pair: self.dp.get_pair_dataframe(pair, self.timeframe) for pair in self.UNIVERSE}
         )
+        btc = self.UNIVERSE[0]
+        market_reference = references.get(btc)
+        if market_reference is None or market_reference.empty:
+            f["market_date"] = NaT
+            f["market_consensus"] = np.nan
+        else:
+            market = self.market_indicators(market_reference, {}).rename(
+                columns={"date": "market_date", "consensus": "market_consensus"}
+            )
+            f = f.merge(
+                market, left_on="date", right_on="market_date", how="left", validate="one_to_one"
+            )
         pieces = []
         for pair in self.UNIVERSE:
-            reference = self.dp.get_pair_dataframe(pair, "1h")
-            if reference.empty:
+            reference = references.get(pair)
+            if reference is None or reference.empty:
                 f["relative_rank"] = np.nan
                 f["universe_valid"] = False
                 break
@@ -126,18 +264,24 @@ class RotationConsensus(IStrategy):
             )
             f = f.merge(lookup, on="date", how="left", validate="one_to_one")
             f["universe_valid"] = f.universe_valid.eq(True)
-        decision = f.date + Timedelta(hours=1)
+        decision = f.date + HOUR
         f["rebalance"] = decision.dt.hour.mod(8).eq(0)
+        f["own_valid"] = f.volume.gt(0)
+        f["market_valid"] = f.market_date.eq(f.date) & f.market_consensus.notna()
+        if runtime:
+            current = f.date.eq(self._rotation_candle)
+            f["own_valid"] &= current & (metadata["pair"] in self._valid_rotation_pairs)
+            f["market_valid"] &= current & (btc in self._valid_rotation_pairs)
+            f["universe_valid"] &= current & self._frozen_rotation
         return f
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         f = dataframe.copy()
         ready = (
             f.history_ok
-            & f.volume.gt(0)
+            & f.own_valid
             & f.distance.notna()
-            & f.market_date.eq(f.date)
-            & f.market_consensus.notna()
+            & f.market_valid
             & f.universe_valid
             & f.rebalance
         )
@@ -156,7 +300,7 @@ class RotationConsensus(IStrategy):
         f["enter_tag"] = ""
         active = f.enter_long.eq(1) | f.enter_short.eq(1)
         f.loc[active, "enter_tag"] = f.loc[active, "distance"].map(lambda x: f"vc_d={x:.8f}")
-        if self.config.get("runmode") in (RunMode.DRY_RUN, RunMode.LIVE) and not f.empty:
+        if self._runtime_snapshot_enabled() and not f.empty:
             row = f.iloc[-1]
             logger.info(
                 "RotationConsensus %s candle=%s score=%.3f market=%.3f rank=%s "
@@ -176,32 +320,46 @@ class RotationConsensus(IStrategy):
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         f = dataframe.copy()
+        market_ready = f.own_valid & f.rebalance & f.market_valid
+        rank_ready = f.own_valid & f.rebalance & f.universe_valid
+        f["own_exit_long"] = f.own_valid & f.consensus.le(0)
+        f["own_exit_short"] = f.own_valid & f.consensus.ge(0)
+        f["market_exit_long"] = market_ready & f.market_consensus.le(0)
+        f["market_exit_short"] = market_ready & f.market_consensus.ge(0)
         f["exit_long"] = (
-            (
-                f.consensus.le(0)
-                | (
-                    f.rebalance
-                    & (
-                        ~f.universe_valid
-                        | f.relative_rank.lt(len(self.UNIVERSE) - 2)
-                        | f.market_consensus.le(0)
-                    )
-                )
-            )
-            & f.volume.gt(0)
+            f.own_exit_long
+            | f.market_exit_long
+            | (rank_ready & f.relative_rank.lt(len(self.UNIVERSE) - 2))
         ).astype(int)
         f["exit_short"] = (
-            (
-                f.consensus.ge(0)
-                | (
-                    f.rebalance
-                    & (~f.universe_valid | f.relative_rank.gt(3) | f.market_consensus.ge(0))
-                )
-            )
-            & f.volume.gt(0)
+            f.own_exit_short | f.market_exit_short | (rank_ready & f.relative_rank.gt(3))
         ).astype(int)
         f["exit_tag"] = "consensus_reversed"
         return f
+
+    def get_exit_signal(self, pair, timeframe, dataframe, is_short=None):
+        if not self._runtime_snapshot_enabled():
+            return super().get_exit_signal(pair, timeframe, dataframe, is_short)
+        now = Timestamp(dt_now())
+        candle = now.floor("h") - HOUR
+        if dataframe.empty or self._rotation_candle != candle or dataframe.date.iloc[-1] != candle:
+            return False, False, None
+        enter, exit_signal, _ = super().get_exit_signal(pair, timeframe, dataframe, is_short)
+        within_window = (
+            now - candle - HOUR
+        ).total_seconds() <= self.ignore_buying_expired_candle_after
+        enter = bool(enter and within_window)
+        if not exit_signal:
+            return enter, False, None
+        side = "short" if is_short else "long"
+        latest = dataframe.iloc[-1]
+        if latest[f"own_exit_{side}"]:
+            return enter, True, "consensus_reversed"
+        if latest[f"market_exit_{side}"]:
+            return enter, True, "market_consensus_reversed"
+        if within_window:
+            return enter, True, "rotation_rank_changed"
+        return enter, False, None
 
     @staticmethod
     def _distance(tag):
